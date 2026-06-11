@@ -35,9 +35,14 @@ interpreter = None
 def load_model():
     global interpreter
     try:
+        print(f'🔍 Model path: {MODEL_PATH}')
+        print(f'🔍 Model exists: {os.path.exists(MODEL_PATH)}')
         interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
-        print('✅ Model loaded successfully:', MODEL_PATH)
+        print('✅ Model loaded successfully')
+        # Print input details to confirm
+        input_details = interpreter.get_input_details()
+        print(f'✅ Input shape: {input_details[0]["shape"]}')
         return True
     except Exception as e:
         print(f'❌ Error loading model: {e}')
