@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import tflite_runtime.interpreter as tflite
+import tensorflow as tf
 import numpy as np
 from PIL import Image
 import base64
@@ -35,7 +35,7 @@ interpreter = None
 def load_model():
     global interpreter
     try:
-        interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
         print('✅ Model loaded successfully:', MODEL_PATH)
         return True
