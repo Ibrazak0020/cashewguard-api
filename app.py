@@ -189,6 +189,86 @@ def health():
         'model_loaded': interpreter is not None
     })
 
+
+# ============================================
+# ✅ NEW: VALIDATE ENDPOINT
+# Called from image_preview screen BEFORE full prediction.
+# Only does color analysis — no model inference — very fast.
+# ============================================
+@app.route('/validate', methods=['POST'])
+def validate():
+    """
+    Lightweight cashew leaf validation.
+    Returns: { 'is_leaf': bool, 'reason': str, 'message': str }
+    """
+    try:
+        data = request.get_json()
+
+        if not data or 'image' not in data:
+            return jsonify({'error': 'No image provided'}), 400
+
+        # Decode image
+        image_data = data['image']
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
+
+        image_bytes = base64.b64decode(image_data)
+        pil_image   = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+
+        # Color analysis
+        img_array = np.array(pil_image.resize((64, 64)))
+
+        r = img_array[:, :, 0].astype(float)
+        g = img_array[:, :, 1].astype(float)
+        b = img_array[:, :, 2].astype(float)
+
+        mean_r = np.mean(r)
+        mean_g = np.mean(g)
+        mean_b = np.mean(b)
+
+        print(f'🎨 Validate RGB — R:{mean_r:.1f} G:{mean_g:.1f} B:{mean_b:.1f}')
+
+        green_dominant  = (mean_g > mean_r) and (mean_g > mean_b)
+        green_pixels    = np.sum((g > r * 0.85) & (g > b * 0.85) & (g > 60))
+        total_pixels    = img_array.shape[0] * img_array.shape[1]
+        green_ratio     = green_pixels / total_pixels
+        mean_brightness = (mean_r + mean_g + mean_b) / 3
+
+        print(f'🌿 Green dominant: {green_dominant} | Ratio: {green_ratio:.2%} | Brightness: {mean_brightness:.1f}')
+
+        # Validation checks
+        if mean_brightness < 30:
+            return jsonify({
+                'is_leaf': False,
+                'reason':  'too_dark',
+                'message': 'The image is too dark. Please take a photo in better lighting.',
+            })
+
+        if mean_brightness > 230:
+            return jsonify({
+                'is_leaf': False,
+                'reason':  'too_bright',
+                'message': 'The image is too bright or blank. Please try again.',
+            })
+
+        if not green_dominant and green_ratio < 0.15:
+            return jsonify({
+                'is_leaf': False,
+                'reason':  'not_green',
+                'message': 'This does not appear to be a cashew leaf. Please upload a clear photo of a cashew leaf.',
+            })
+
+        print('✅ Validation passed — image looks like a leaf')
+        return jsonify({
+            'is_leaf': True,
+            'reason':  'valid',
+            'message': 'Image looks good. Proceeding to analysis.',
+        })
+
+    except Exception as e:
+        print(f'❌ Validation error: {e}')
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
