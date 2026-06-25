@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import tensorflow as tf
@@ -14,7 +15,8 @@ CORS(app)
 # MODEL CONFIGURATION
 # ============================================
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'cashew_model_final.tflite')
+MODEL_PATH     = os.path.join(os.path.dirname(__file__), 'cashew_model_final.tflite')
+VALIDATOR_PATH = os.path.join(os.path.dirname(__file__), 'leaf_validator.tflite')
 
 CLASS_NAMES = ['anthracnose', 'gumosis', 'healthy', 'leaf_miner', 'red_rust']
 
@@ -26,8 +28,11 @@ DISPLAY_NAMES = {
     'red_rust':    'Red Rust',
 }
 
+# ✅ Optimal threshold from binary classifier training (98.12% accuracy)
+VALIDATOR_THRESHOLD = 0.3
+
 # ============================================
-# LOAD TFLITE MODEL
+# LOAD DISEASE MODEL
 # ============================================
 interpreter = None
 
@@ -38,12 +43,30 @@ def load_model():
         print(f'🔍 Model exists: {os.path.exists(MODEL_PATH)}')
         interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
-        print('✅ Model loaded successfully')
+        print('✅ Disease model loaded successfully')
         input_details = interpreter.get_input_details()
         print(f'✅ Input shape: {input_details[0]["shape"]}')
         return True
     except Exception as e:
-        print(f'❌ Error loading model: {e}')
+        print(f'❌ Error loading disease model: {e}')
+        return False
+
+# ============================================
+# ✅ LOAD LEAF VALIDATOR MODEL
+# ============================================
+validator_interpreter = None
+
+def load_validator():
+    global validator_interpreter
+    try:
+        print(f'🔍 Validator path: {VALIDATOR_PATH}')
+        print(f'🔍 Validator exists: {os.path.exists(VALIDATOR_PATH)}')
+        validator_interpreter = tf.lite.Interpreter(model_path=VALIDATOR_PATH)
+        validator_interpreter.allocate_tensors()
+        print('✅ Leaf validator model loaded successfully')
+        return True
+    except Exception as e:
+        print(f'❌ Error loading validator model: {e}')
         return False
 
 # ============================================
@@ -69,58 +92,32 @@ def preprocess_image(image_data):
         return None, None
 
 # ============================================
-# LEAF VALIDATION
+# ✅ RUN LEAF VALIDATOR — binary classifier
+# Returns confidence score (0.0 to 1.0)
+# cashew_leaf = close to 1.0
+# not_cashew  = close to 0.0
 # ============================================
-def is_cashew_leaf(pil_image, predictions):
-    """
-    Returns (is_leaf: bool, reason: str)
-    Validates using color analysis + model confidence threshold.
-    """
+def run_validator(img_array):
+    try:
+        if validator_interpreter is None:
+            print('⚠️ Validator not loaded — skipping')
+            return None
 
-    # Signal 1: Model confidence threshold
-    max_confidence = float(np.max(predictions))
-    if max_confidence < 0.40:
-        print(f'❌ Low confidence: {max_confidence:.2%} — not a cashew leaf')
-        return False, 'low_confidence'
+        input_details  = validator_interpreter.get_input_details()
+        output_details = validator_interpreter.get_output_details()
 
-    # Signal 2: Green dominance color check
-    img_array = np.array(pil_image.resize((64, 64)))
+        validator_interpreter.set_tensor(input_details[0]['index'], img_array)
+        validator_interpreter.invoke()
 
-    r = img_array[:, :, 0].astype(float)
-    g = img_array[:, :, 1].astype(float)
-    b = img_array[:, :, 2].astype(float)
+        output = validator_interpreter.get_tensor(output_details[0]['index'])
+        return float(output[0][0])  # single sigmoid value
 
-    mean_r = np.mean(r)
-    mean_g = np.mean(g)
-    mean_b = np.mean(b)
-
-    print(f'🎨 RGB means — R:{mean_r:.1f} G:{mean_g:.1f} B:{mean_b:.1f}')
-
-    green_dominant = (mean_g > mean_r) and (mean_g > mean_b)
-    green_pixels   = np.sum((g > r * 0.85) & (g > b * 0.85) & (g > 60))
-    total_pixels   = img_array.shape[0] * img_array.shape[1]
-    green_ratio    = green_pixels / total_pixels
-
-    print(f'🌿 Green dominant: {green_dominant} | Green ratio: {green_ratio:.2%}')
-
-    if not green_dominant and green_ratio < 0.15:
-        print('❌ Not enough green — not a cashew leaf')
-        return False, 'not_green'
-
-    # Signal 3: Brightness check
-    mean_brightness = (mean_r + mean_g + mean_b) / 3
-    if mean_brightness < 30:
-        print(f'❌ Image too dark: brightness={mean_brightness:.1f}')
-        return False, 'too_dark'
-    if mean_brightness > 230:
-        print(f'❌ Image too bright/blank: brightness={mean_brightness:.1f}')
-        return False, 'too_bright'
-
-    print('✅ Image passed leaf validation')
-    return True, 'valid'
+    except Exception as e:
+        print(f'❌ Validator error: {e}')
+        return None
 
 # ============================================
-# RUN PREDICTION
+# RUN DISEASE PREDICTION
 # ============================================
 def run_prediction(img_array):
     try:
@@ -138,26 +135,16 @@ def run_prediction(img_array):
         return None
 
 # ============================================
-# ✅ UPDATED: INFECTED AREA CALCULATION
+# INFECTED AREA CALCULATION
 # ============================================
 def get_infected_area(disease_key, confidence):
-    """
-    Estimates infected leaf area percentage.
-      - Healthy class always returns 0%
-      - Disease classes: confidence scaled to infected area (1–100%)
-    """
     if disease_key == 'healthy':
         return 0.0
     infected = round(max(1.0, confidence * 100), 1)
     return min(infected, 100.0)
 
 # ============================================
-# ✅ UPDATED: SEVERITY LEVEL
-# Standard plant pathology severity scale:
-#   Healthy  → predicted class is healthy (0% infected)
-#   Mild     → 1%  to 25% infected area
-#   Moderate → 26% to 50% infected area
-#   Severe   → above 50% infected area
+# SEVERITY LEVEL
 # ============================================
 def get_severity(disease_key, infected_area):
     if disease_key == 'healthy':
@@ -176,30 +163,32 @@ def get_severity(disease_key, infected_area):
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        'status':  'CashewGuard AI API is running ✅',
-        'model':   'Best CNN Variant (Tuned)',
-        'classes': CLASS_NAMES,
-        'version': '2.0.0'
+        'status':           'CashewGuard AI API is running ✅',
+        'disease_model':    'Best CNN Variant (Tuned)',
+        'validator_model':  'MobileNetV2 Binary Classifier',
+        'classes':          CLASS_NAMES,
+        'version':          '3.0.0'
     })
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        'status':       'healthy',
-        'model_loaded': interpreter is not None
+        'status':             'healthy',
+        'model_loaded':       interpreter is not None,
+        'validator_loaded':   validator_interpreter is not None,
     })
 
-
 # ============================================
-# ✅ NEW: VALIDATE ENDPOINT
-# Called from image_preview screen BEFORE full prediction.
-# Only does color analysis — no model inference — very fast.
+# ✅ UPDATED: VALIDATE ENDPOINT
+# Now runs leaf_validator.tflite on the server
+# Same 98.12% accuracy as mobile TFLite validation
+# Web gets identical validation quality as mobile
 # ============================================
 @app.route('/validate', methods=['POST'])
 def validate():
     """
-    Lightweight cashew leaf validation.
-    Returns: { 'is_leaf': bool, 'reason': str, 'message': str }
+    Validates if image is a cashew leaf using leaf_validator.tflite.
+    Returns: { 'is_leaf': bool, 'confidence': float, 'message': str }
     """
     try:
         data = request.get_json()
@@ -207,68 +196,80 @@ def validate():
         if not data or 'image' not in data:
             return jsonify({'error': 'No image provided'}), 400
 
-        # Decode image
-        image_data = data['image']
-        if ',' in image_data:
-            image_data = image_data.split(',')[1]
+        # Preprocess image
+        img_array, pil_image = preprocess_image(data['image'])
+        if img_array is None:
+            return jsonify({'error': 'Failed to process image'}), 400
 
-        image_bytes = base64.b64decode(image_data)
-        pil_image   = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        # ✅ Run leaf_validator.tflite
+        confidence = run_validator(img_array)
 
-        # Color analysis
-        img_array = np.array(pil_image.resize((64, 64)))
-
-        r = img_array[:, :, 0].astype(float)
-        g = img_array[:, :, 1].astype(float)
-        b = img_array[:, :, 2].astype(float)
-
-        mean_r = np.mean(r)
-        mean_g = np.mean(g)
-        mean_b = np.mean(b)
-
-        print(f'🎨 Validate RGB — R:{mean_r:.1f} G:{mean_g:.1f} B:{mean_b:.1f}')
-
-        green_dominant  = (mean_g > mean_r) and (mean_g > mean_b)
-        green_pixels    = np.sum((g > r * 0.85) & (g > b * 0.85) & (g > 60))
-        total_pixels    = img_array.shape[0] * img_array.shape[1]
-        green_ratio     = green_pixels / total_pixels
-        mean_brightness = (mean_r + mean_g + mean_b) / 3
-
-        print(f'🌿 Green dominant: {green_dominant} | Ratio: {green_ratio:.2%} | Brightness: {mean_brightness:.1f}')
-
-        # Validation checks
-        if mean_brightness < 30:
+        if confidence is None:
+            # Validator not loaded — fall back to color analysis
+            print('⚠️ Validator unavailable — using color analysis fallback')
+            is_leaf, reason = _color_analysis(pil_image)
+            message = 'This does not appear to be a cashew leaf. Please upload a clear photo of a cashew leaf.' \
+                      if not is_leaf else 'Image looks good. Proceeding to analysis.'
             return jsonify({
-                'is_leaf': False,
-                'reason':  'too_dark',
-                'message': 'The image is too dark. Please take a photo in better lighting.',
+                'is_leaf':    is_leaf,
+                'confidence': 0.0,
+                'reason':     reason,
+                'message':    message,
             })
 
-        if mean_brightness > 230:
+        is_cashew = confidence >= VALIDATOR_THRESHOLD
+
+        print(f'🌿 Validator confidence: {confidence*100:.1f}% | '
+              f'threshold: {VALIDATOR_THRESHOLD} | isCashew: {is_cashew}')
+
+        if not is_cashew:
             return jsonify({
-                'is_leaf': False,
-                'reason':  'too_bright',
-                'message': 'The image is too bright or blank. Please try again.',
+                'is_leaf':    False,
+                'confidence': round(confidence, 4),
+                'reason':     'not_cashew_leaf',
+                'message':    'This does not appear to be a cashew leaf. '
+                              'Please upload a clear photo of a cashew leaf.',
             })
 
-        if not green_dominant and green_ratio < 0.15:
-            return jsonify({
-                'is_leaf': False,
-                'reason':  'not_green',
-                'message': 'This does not appear to be a cashew leaf. Please upload a clear photo of a cashew leaf.',
-            })
-
-        print('✅ Validation passed — image looks like a leaf')
         return jsonify({
-            'is_leaf': True,
-            'reason':  'valid',
-            'message': 'Image looks good. Proceeding to analysis.',
+            'is_leaf':    True,
+            'confidence': round(confidence, 4),
+            'reason':     'valid',
+            'message':    'Image validated as cashew leaf. Proceeding to analysis.',
         })
 
     except Exception as e:
         print(f'❌ Validation error: {e}')
         return jsonify({'error': str(e)}), 500
 
+
+def _color_analysis(pil_image):
+    """Fallback color analysis if validator model is unavailable."""
+    img_array       = np.array(pil_image.resize((64, 64)))
+    r               = img_array[:, :, 0].astype(float)
+    g               = img_array[:, :, 1].astype(float)
+    b               = img_array[:, :, 2].astype(float)
+    mean_r          = np.mean(r)
+    mean_g          = np.mean(g)
+    mean_b          = np.mean(b)
+    green_dominant  = (mean_g > mean_r) and (mean_g > mean_b)
+    green_pixels    = np.sum((g > r * 0.85) & (g > b * 0.85) & (g > 60))
+    total_pixels    = img_array.shape[0] * img_array.shape[1]
+    green_ratio     = green_pixels / total_pixels
+    mean_brightness = (mean_r + mean_g + mean_b) / 3
+
+    if mean_brightness < 30:
+        return False, 'too_dark'
+    if mean_brightness > 230:
+        return False, 'too_bright'
+    if not green_dominant and green_ratio < 0.15:
+        return False, 'not_green'
+    return True, 'valid'
+
+
+# ============================================
+# PREDICT ENDPOINT
+# ============================================
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
@@ -277,21 +278,28 @@ def predict():
         if not data or 'image' not in data:
             return jsonify({'error': 'No image provided'}), 400
 
-        # Step 1: Preprocess image
+        # Step 1: Preprocess
         img_array, pil_image = preprocess_image(data['image'])
         if img_array is None:
             return jsonify({'error': 'Failed to process image'}), 400
 
-        # Step 2: Run prediction
+        # Step 2: Run disease prediction
         predictions = run_prediction(img_array)
         if predictions is None:
             return jsonify({'error': 'Prediction failed'}), 500
 
-        # Step 3: Validate — is this actually a cashew leaf?
-        is_leaf, reason = is_cashew_leaf(pil_image, predictions)
+        # Step 3: Validate with binary classifier
+        val_confidence = run_validator(img_array)
+
+        if val_confidence is not None:
+            # Use binary classifier result
+            is_leaf = val_confidence >= VALIDATOR_THRESHOLD
+            print(f'🌿 Predict-level validator: {val_confidence*100:.1f}% | isCashew: {is_leaf}')
+        else:
+            # Fallback to color analysis
+            is_leaf, _ = _color_analysis(pil_image)
 
         if not is_leaf:
-            print(f'🚫 Image rejected: {reason}')
             return jsonify({
                 'success':         False,
                 'disease':         'Unrecognized',
@@ -300,8 +308,8 @@ def predict():
                 'severity':        'Unknown',
                 'infected_area':   0.0,
                 'all_predictions': {},
-                'reason':          reason,
-                'message':         'The uploaded image does not appear to be a cashew leaf. Please upload a clear photo of a cashew leaf.',
+                'reason':          'not_cashew_leaf',
+                'message':         'The uploaded image does not appear to be a cashew leaf.',
             })
 
         # Step 4: Process valid prediction
@@ -310,7 +318,6 @@ def predict():
         disease_key     = CLASS_NAMES[predicted_index]
         disease_name    = DISPLAY_NAMES[disease_key]
 
-        # ✅ UPDATED: Use new infected area + severity calculations
         infected_area = get_infected_area(disease_key, confidence)
         severity      = get_severity(disease_key, infected_area)
 
@@ -340,8 +347,10 @@ def predict():
 # START SERVER
 # ============================================
 if __name__ == '__main__':
-    print('🌱 Starting CashewGuard AI API v2.0...')
+    print('🌱 Starting CashewGuard AI API v3.0...')
     load_model()
+    load_validator()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
 else:
     load_model()
+    load_validator()
