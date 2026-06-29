@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import tensorflow as tf
@@ -64,6 +63,13 @@ def load_validator():
         validator_interpreter = tf.lite.Interpreter(model_path=VALIDATOR_PATH)
         validator_interpreter.allocate_tensors()
         print('✅ Leaf validator model loaded successfully')
+        
+        # Print validator input/output details for debugging
+        input_details = validator_interpreter.get_input_details()
+        output_details = validator_interpreter.get_output_details()
+        print(f'✅ Validator input shape: {input_details[0]["shape"]}')
+        print(f'✅ Validator output shape: {output_details[0]["shape"]}')
+        
         return True
     except Exception as e:
         print(f'❌ Error loading validator model: {e}')
@@ -93,9 +99,7 @@ def preprocess_image(image_data):
 
 # ============================================
 # ✅ RUN LEAF VALIDATOR — binary classifier
-# Returns confidence score (0.0 to 1.0)
-# cashew_leaf = close to 1.0
-# not_cashew  = close to 0.0
+# FIXED: Now correctly interprets model output
 # ============================================
 def run_validator(img_array):
     try:
@@ -110,7 +114,20 @@ def run_validator(img_array):
         validator_interpreter.invoke()
 
         output = validator_interpreter.get_tensor(output_details[0]['index'])
-        return float(output[0][0])  # single sigmoid value
+        raw_value = float(output[0][0])
+        
+        # 🔍 Debug output
+        print(f'🔍 Validator raw output: {raw_value:.4f}')
+        
+        # 🔧 FIX: Invert the interpretation
+        # Model was trained with: 0 = cashew leaf, 1 = non-cashew leaf
+        # So lower confidence = more likely to be cashew leaf
+        # Convert to a "cashew leaf confidence" score (0-1, higher = more likely leaf)
+        cashew_confidence = 1.0 - raw_value
+        
+        print(f'🌿 Converted cashew confidence: {cashew_confidence:.4f}')
+        
+        return cashew_confidence
 
     except Exception as e:
         print(f'❌ Validator error: {e}')
@@ -167,7 +184,7 @@ def home():
         'disease_model':    'Best CNN Variant (Tuned)',
         'validator_model':  'MobileNetV2 Binary Classifier',
         'classes':          CLASS_NAMES,
-        'version':          '3.0.0'
+        'version':          '3.0.1'  # Updated version
     })
 
 @app.route('/health', methods=['GET'])
@@ -176,13 +193,12 @@ def health():
         'status':             'healthy',
         'model_loaded':       interpreter is not None,
         'validator_loaded':   validator_interpreter is not None,
+        'validator_threshold': VALIDATOR_THRESHOLD,
     })
 
 # ============================================
-# ✅ UPDATED: VALIDATE ENDPOINT
-# Now runs leaf_validator.tflite on the server
-# Same 98.12% accuracy as mobile TFLite validation
-# Web gets identical validation quality as mobile
+# ✅ FIXED: VALIDATE ENDPOINT
+# Now correctly interprets validator output
 # ============================================
 @app.route('/validate', methods=['POST'])
 def validate():
@@ -201,10 +217,10 @@ def validate():
         if img_array is None:
             return jsonify({'error': 'Failed to process image'}), 400
 
-        # ✅ Run leaf_validator.tflite
-        confidence = run_validator(img_array)
+        # ✅ Run leaf_validator.tflite (now returns cashew confidence)
+        cashew_confidence = run_validator(img_array)
 
-        if confidence is None:
+        if cashew_confidence is None:
             # Validator not loaded — fall back to color analysis
             print('⚠️ Validator unavailable — using color analysis fallback')
             is_leaf, reason = _color_analysis(pil_image)
@@ -217,15 +233,16 @@ def validate():
                 'message':    message,
             })
 
-        is_cashew = confidence >= VALIDATOR_THRESHOLD
+        # 🔧 FIXED: Now cashew_confidence is already inverted (higher = more likely leaf)
+        is_cashew = cashew_confidence >= VALIDATOR_THRESHOLD
 
-        print(f'🌿 Validator confidence: {confidence*100:.1f}% | '
+        print(f'🌿 Validator confidence (cashew): {cashew_confidence*100:.1f}% | '
               f'threshold: {VALIDATOR_THRESHOLD} | isCashew: {is_cashew}')
 
         if not is_cashew:
             return jsonify({
                 'is_leaf':    False,
-                'confidence': round(confidence, 4),
+                'confidence': round(cashew_confidence, 4),
                 'reason':     'not_cashew_leaf',
                 'message':    'This does not appear to be a cashew leaf. '
                               'Please upload a clear photo of a cashew leaf.',
@@ -233,7 +250,7 @@ def validate():
 
         return jsonify({
             'is_leaf':    True,
-            'confidence': round(confidence, 4),
+            'confidence': round(cashew_confidence, 4),
             'reason':     'valid',
             'message':    'Image validated as cashew leaf. Proceeding to analysis.',
         })
@@ -268,7 +285,8 @@ def _color_analysis(pil_image):
 
 
 # ============================================
-# PREDICT ENDPOINT
+# ✅ FIXED: PREDICT ENDPOINT
+# Now correctly interprets validator output
 # ============================================
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -289,12 +307,12 @@ def predict():
             return jsonify({'error': 'Prediction failed'}), 500
 
         # Step 3: Validate with binary classifier
-        val_confidence = run_validator(img_array)
+        cashew_confidence = run_validator(img_array)
 
-        if val_confidence is not None:
-            # Use binary classifier result
-            is_leaf = val_confidence >= VALIDATOR_THRESHOLD
-            print(f'🌿 Predict-level validator: {val_confidence*100:.1f}% | isCashew: {is_leaf}')
+        if cashew_confidence is not None:
+            # 🔧 FIXED: cashew_confidence is already inverted (higher = more likely leaf)
+            is_leaf = cashew_confidence >= VALIDATOR_THRESHOLD
+            print(f'🌿 Predict-level validator: {cashew_confidence*100:.1f}% | isCashew: {is_leaf}')
         else:
             # Fallback to color analysis
             is_leaf, _ = _color_analysis(pil_image)
@@ -344,12 +362,68 @@ def predict():
         return jsonify({'error': str(e)}), 500
 
 # ============================================
+# ✅ NEW: DEBUG ENDPOINT to test validator
+# ============================================
+@app.route('/debug/validator', methods=['POST'])
+def debug_validator():
+    """
+    Debug endpoint to test validator raw output
+    Returns raw model output without any interpretation
+    """
+    try:
+        data = request.get_json()
+        if not data or 'image' not in data:
+            return jsonify({'error': 'No image provided'}), 400
+
+        img_array, pil_image = preprocess_image(data['image'])
+        if img_array is None:
+            return jsonify({'error': 'Failed to process image'}), 400
+
+        if validator_interpreter is None:
+            return jsonify({'error': 'Validator not loaded'}), 500
+
+        input_details = validator_interpreter.get_input_details()
+        output_details = validator_interpreter.get_output_details()
+
+        validator_interpreter.set_tensor(input_details[0]['index'], img_array)
+        validator_interpreter.invoke()
+
+        raw_output = validator_interpreter.get_tensor(output_details[0]['index'])
+        raw_value = float(raw_output[0][0])
+        
+        # Also run color analysis for comparison
+        is_leaf_color, color_reason = _color_analysis(pil_image)
+
+        return jsonify({
+            'raw_output': raw_value,
+            'cashew_confidence': 1.0 - raw_value,  # Inverted
+            'threshold': VALIDATOR_THRESHOLD,
+            'is_cashew_by_model': (1.0 - raw_value) >= VALIDATOR_THRESHOLD,
+            'color_analysis': {
+                'is_leaf': is_leaf_color,
+                'reason': color_reason
+            },
+            'interpretation': f"Model output {raw_value:.4f} means {'cashew leaf' if raw_value < 0.5 else 'non-cashew leaf'} (approximately)"
+        })
+
+    except Exception as e:
+        print(f'❌ Debug error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+# ============================================
 # START SERVER
 # ============================================
 if __name__ == '__main__':
-    print('🌱 Starting CashewGuard AI API v3.0...')
+    print('🌱 Starting CashewGuard AI API v3.0.1 (Fixed Validator)...')
+    print('=' * 50)
     load_model()
     load_validator()
+    print('=' * 50)
+    print('🚀 Server ready!')
+    print('📌 Use /debug/validator to test validator output')
+    print('📌 Use /validate to check if image is a cashew leaf')
+    print('📌 Use /predict for full disease prediction')
+    print('=' * 50)
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
 else:
     load_model()
