@@ -28,7 +28,7 @@ DISPLAY_NAMES = {
 }
 
 # ✅ Optimal threshold from binary classifier training (98.12% accuracy)
-VALIDATOR_THRESHOLD = 0.6  # ✅ Raised from 0.3 to be stricter against false positives
+VALIDATOR_THRESHOLD = 0.3  # ✅ Raised from 0.3 to be stricter against false positives
 
 # ============================================
 # LOAD DISEASE MODEL
